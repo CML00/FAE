@@ -8,6 +8,8 @@ import pandas as pd
 
 from FAE.Func.Visualization import LoadWaitBar
 
+import traceback
+
 class RadiomicsFeatureExtractor:
     def __init__(self, radiomics_parameter_file, config_file, modality_name_list):
         self.feature_values = []
@@ -21,6 +23,7 @@ class RadiomicsFeatureExtractor:
             self.extractor = featureextractor.RadiomicsFeaturesExtractor(radiomics_parameter_file)
             self.LoadFileConfig(config_file)
         except:
+            traceback.print_exc()
             print('Check the config file path.')
 
     def LoadFileConfig(self, config_file):
@@ -31,7 +34,13 @@ class RadiomicsFeatureExtractor:
                     self.config_dict[row[0]] = row[1]
 
     def __GetFeatureValuesEachModality(self, data_path, roi_path, modality_name):
-        result = self.extractor.execute(data_path, roi_path)
+        try:
+            result = self.extractor.execute(data_path, roi_path)
+        except Exception as e:
+            traceback.print_exc()
+            return '', []
+
+
         feature_names = []
         feature_values = list(result.values())
         for feature_name in list(result.keys()):
@@ -157,7 +166,6 @@ class RadiomicsFeatureExtractor:
                 writer.writerow([feature_name, feature_value])
 
     def __IterateCase(self, root_folder, store_path=''):
-        num_cases = 0
         case_name_list = os.listdir(root_folder)
         case_name_list.sort()
         for case_name in case_name_list:
@@ -203,10 +211,7 @@ class RadiomicsFeatureExtractor:
     def Execute(self, root_folder, store_folder=''):
         if not os.path.exists(store_folder):
             os.mkdir(store_folder)
-        self.__IterateCase(root_folder, store_path=os.path.join(store_folder, 'Features.csv'))
-        # label_reader = LabelReader()
-        # label_reader.LoadLabel(root_folder=root_folder)
-        # label_reader.Save(os.path.join(store_folder, 'label.npy'))
+        self.__IterateCase(root_folder, store_path=os.path.join(store_folder, 'features.csv'))
 
 def main():
     extractor = RadiomicsFeatureExtractor(r'..\RadiomicsParams.yaml', r'x:\Radiomics_ZhangJing\MM_Ly\FileConfig.csv', ['T1C'])

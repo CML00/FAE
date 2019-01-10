@@ -3,17 +3,13 @@ import numpy as np
 import os
 import numbers
 import csv
-import pandas as pd
-
-from sklearn.model_selection import KFold, StratifiedKFold, LeaveOneOut
+from copy import deepcopy
+from sklearn.model_selection import StratifiedKFold, LeaveOneOut
 
 from FAE.DataContainer.DataContainer import DataContainer
 from FAE.FeatureAnalysis.Classifier import Classifier
-from FAE.FeatureAnalysis.FeatureSelector import FeatureSelectPipeline, FeatureSelectByAnalysis, FeatureSelector
 from FAE.Func.Metric import EstimateMetirc
-from FAE.Visualization.PlotMetricVsFeatureNumber import DrawCurve
-from FAE.Visualization.DrawROCList import DrawROCList
-from FAE.Func.Visualization import LoadWaitBar
+from FAE.HyperParameterConfig.HyperParamManager import HyperParameterManager
 
 class CrossValidation:
     '''
@@ -21,29 +17,40 @@ class CrossValidation:
     and 5-folders. A classifier must be set before run CV. A training metric and validation metric will be returned.
     If a testing data container was also set, the test metric will be return.
     '''
-    def __init__(self, cv_method):
+    def __init__(self):
+        self._raw_classifier = Classifier()
         self.__classifier = Classifier()
+        self._hyper_parameter_manager = HyperParameterManager()
+        self.__classifier_parameter_list = [{}]
 
-        if cv_method == 'LOO':
-            self.__cv = LeaveOneOut
-        elif cv_method == '10-folder':
-            self.__cv = StratifiedKFold(10)
-        elif cv_method == '5-folder':
-            self.__cv = StratifiedKFold(5)
-        else:
-            self.__cv = None
+    def SetDefaultClassifier(self):
+        self.__classifier = deepcopy(self._raw_classifier)
 
     def SetClassifier(self, classifier):
+        self.__init__()
+        self._raw_classifier = deepcopy(classifier)
         self.__classifier = classifier
 
     def GetClassifier(self):
         return self.__classifier
+    classifier = property(GetClassifier, SetClassifier)
 
-    def SetCV(self, cv):
-        self.__cv = cv
+    def AutoLoadClassifierParameterList(self, relative_path=r'HyperParameters\Classifier'):
+        self._hyper_parameter_manager.LoadSpecificConfig(self.classifier.GetName(), relative_path=relative_path)
+        self.__classifier_parameter_list = self._hyper_parameter_manager.GetParameterSetting()
 
-    def GetCV(self):
-        return self.__cv
+    def SetClassifierParameterList(self, classifier_parameter_list):
+        self.__classifier_parameter_list = deepcopy(classifier_parameter_list)
+
+    def GetClassifierParameterList(self):
+        return self.__classifier_parameter_list
+    classifier_parameter_list = property(GetClassifierParameterList, SetClassifierParameterList)
+
+    def _GetNameOfParamDict(self, param_dict):
+        name = ''
+        for key, item in param_dict.items():
+            name += str(key) + '_' + str(item) + '-'
+        return name[:len(name) - 1]
 
     def SaveResult(self, info, store_path):
         info = dict(sorted(info.items(), key= lambda item: item[0]))
@@ -69,26 +76,54 @@ class CrossValidation:
             write_info.sort()
             writer.writerows(write_info)
 
+class CrossValidationLeaveOneOut(CrossValidation):
+    def __init__(self):
+        super(CrossValidationLeaveOneOut, self).__init__()
+        self.__cv = LeaveOneOut()
+
+    def GetCV(self):
+        return self.__cv
+
+    def GetName(self):
+        return 'LeaveOneOut'
+
+    def GetDescription(self, is_test_data_container=False):
+        if is_test_data_container:
+            text = "To determine the hyper-parameter (e.g. the number of features) of model, we applied cross validation " \
+                   "with leave-one-out on the training data set. The hyper-parameters were set according to the model performance " \
+                   "on the validation data set. "
+        else:
+            text = "To prove the performance of the model, we applied corss validation with leave-one-out on the data set. "
+
+        return text
+
     def Run(self, data_container, test_data_container=DataContainer(), store_folder=''):
         train_pred_list, train_label_list, val_pred_list, val_label_list = [], [], [], []
 
         data = data_container.GetArray()
         label = data_container.GetLabel()
-        val_index_store = []
+        case_name = data_container.GetCaseName()
+
+        train_cv_info = [['CaseName', 'Pred', 'Label']]
+        val_cv_info = [['CaseName', 'Pred', 'Label']]
 
         for train_index, val_index in self.__cv.split(data, label):
-            val_index_store.extend(val_index)
-
             train_data = data[train_index, :]
             train_label = label[train_index]
             val_data = data[val_index, :]
             val_label = label[val_index]
 
-            self.__classifier.SetData(train_data, train_label)
-            self.__classifier.Fit()
+            self.classifier.SetData(train_data, train_label)
+            self.classifier.Fit()
 
-            train_prob = self.__classifier.Predict(train_data)
-            val_prob = self.__classifier.Predict(val_data)
+            train_prob = self.classifier.Predict(train_data)
+            val_prob = self.classifier.Predict(val_data)
+
+            for index in range(len(train_index)):
+                train_cv_info.append(
+                    [case_name[train_index[index]], train_prob[index], train_label[index]])
+            for index in range(len(val_index)):
+                val_cv_info.append([case_name[val_index[index]], val_prob[index], val_label[index]])
 
             train_pred_list.extend(train_prob)
             train_label_list.extend(train_label)
@@ -103,22 +138,22 @@ class CrossValidation:
         total_pred = np.asarray(val_pred_list, dtype=np.float32)
         val_metric = EstimateMetirc(total_pred, total_label, 'val')
 
-        self.__classifier.SetDataContainer(data_container)
-        self.__classifier.Fit()
+        self.classifier.SetDataContainer(data_container)
+        self.classifier.Fit()
 
         test_metric = {}
         if test_data_container.GetArray().size > 0:
-            selected_feature_name = data_container.GetFeatureName()
-            fs = FeatureSelector()
-            test_data_container = fs.SelectFeatureByName(test_data_container, selected_feature_name)
-
             test_data = test_data_container.GetArray()
             test_label = test_data_container.GetLabel()
-            test_pred = self.__classifier.Predict(test_data)
+            test_case_name = test_data_container.GetCaseName()
+            test_pred = self.classifier.Predict(test_data)
 
             test_metric = EstimateMetirc(test_pred, test_label, 'test')
 
-        if store_folder and os.path.isdir(store_folder):
+        if store_folder:
+            if not os.path.exists(store_folder):
+                os.mkdir(store_folder)
+
             info = {}
             info.update(train_metric)
             info.update(val_metric)
@@ -128,123 +163,397 @@ class CrossValidation:
             np.save(os.path.join(store_folder, 'train_label.npy'), total_train_label)
             np.save(os.path.join(store_folder, 'val_label.npy'), total_label)
 
-            cv_info_path = os.path.join(store_folder, 'cv_info.csv')
-            df = pd.DataFrame(data=val_index_store)
-            df.to_csv(cv_info_path)
-
-            DrawROCList(total_train_pred, total_train_label, store_path=os.path.join(store_folder, 'train_ROC.jpg'), is_show=False)
-            DrawROCList(total_pred, total_label, store_path=os.path.join(store_folder, 'val_ROC.jpg'), is_show=False)
+            with open(os.path.join(store_folder, 'train_cvloo_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(train_cv_info)
+            with open(os.path.join(store_folder, 'val_cvloo_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(val_cv_info)
 
             if test_data_container.GetArray().size > 0:
                 info.update(test_metric)
                 np.save(os.path.join(store_folder, 'test_predict.npy'), test_pred)
                 np.save(os.path.join(store_folder, 'test_label.npy'), test_label)
-                DrawROCList(test_pred, test_label, store_path=os.path.join(store_folder, 'test_ROC.jpg'),
-                            is_show=False)
 
-            self.__classifier.Save(store_folder)
+                test_result_info = [['CaseName', 'Pred', 'Label']]
+                for index in range(len(test_label)):
+                    test_result_info.append([test_case_name[index], test_pred[index], test_label[index]])
+                with open(os.path.join(store_folder, 'test_info.csv'), 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerows(test_result_info)
 
+            self.classifier.Save(store_folder)
             self.SaveResult(info, store_folder)
 
         return train_metric, val_metric, test_metric
 
-class CrossValidationOnFeatureNumber(CrossValidation):
-    '''
-    This helps explore the effect of the number of features.
-    TODO: This exploration needs to be applied in the feature selector class. In may opinion, the
-    '''
-    def __init__(self, cv_method, max_feature_number=1):
-        super(CrossValidationOnFeatureNumber, self).__init__(cv_method)
-        self.__max_feature_number = max_feature_number
-        self.__feature_selector = FeatureSelectByAnalysis()
+class CrossValidation5Folder(CrossValidation):
+    def __init__(self):
+        super(CrossValidation5Folder, self).__init__()
+        self.__cv = StratifiedKFold(5)
 
-    def SetMaxFeatureNumber(self, max_feature_number):
-        self.__max_feature_number = max_feature_number
-    def GetMaxFeatureNumber(self):
-        return self.__max_feature_number
+    def GetCV(self):
+        return self.__cv
 
-    def SetFeatureSelector(self, feature_selector):
-        self.__feature_selector = feature_selector
-    def GetFeatureSelector(self):
-        return self.__feature_selector
+    def GetName(self):
+        return '5-Folder'
 
-    def Run(self, data_container, test_data_container=DataContainer(), store_folder='', metric_name_list=('auc', 'accuracy')):
-        train_metric_list = []
-        val_metric_list = []
-        test_metric_list = []
+    def GetDescription(self, is_test_data_container=False):
+        if is_test_data_container:
+            text = "To determine the hyper-parameter (e.g. the number of features) of model, we applied cross validation " \
+                   "with 5-folder on the training data set. The hyper-parameters were set according to the model performance " \
+                   "on the validation data set. "
+        else:
+            text = "To prove the performance of the model, we applied corss validation with 5-folder on the data set. "
 
-        for feature_number in range(1, self.__max_feature_number + 1):
-            LoadWaitBar(self.__max_feature_number, feature_number)
+        return text
 
-            feature_store_folder = os.path.join(store_folder, 'feature_'+str(feature_number))
-            if not os.path.exists(feature_store_folder):
-                os.mkdir(feature_store_folder)
+    def Run(self, data_container, test_data_container=DataContainer(), store_folder='', is_hyper_parameter=False):
+        train_pred_list, train_label_list, val_pred_list, val_label_list = [], [], [], []
 
-            self.__feature_selector.SetSelectedFeatureNumber(feature_number)
-            feature_selected_data_container = self.__feature_selector.Run(data_container, feature_store_folder)
-            # feature_selected_data_container.UsualAndL2Normalize()
+        data = data_container.GetArray()
+        label = data_container.GetLabel()
+        case_name = data_container.GetCaseName()
+        group_index = 0
 
-            train_metric, val_metric, test_metric = super(CrossValidationOnFeatureNumber, self).Run(
-                feature_selected_data_container, test_data_container=test_data_container, store_folder=feature_store_folder)
+        train_cv_info = [['CaseName', 'Group', 'Pred', 'Label']]
+        val_cv_info = [['CaseName', 'Group', 'Pred', 'Label']]
 
-            train_metric_list.append(train_metric)
-            val_metric_list.append(val_metric)
-            test_metric_list.append(test_metric)
+        param_metric_train_auc = []
+        param_metric_val_auc = []
+        param_all = []
 
-        metric_list = []
-        for metric in metric_name_list:
-            metric_ditc = {'train': [], 'val': [], 'test': [], 'name': metric}
-            for feature_number in range(self.__max_feature_number):
-                metric_ditc['train'].append(float(train_metric_list[feature_number]['train_' + metric]))
-                metric_ditc['val'].append(float(val_metric_list[feature_number]['val_' + metric]))
-                if test_metric_list[0] != {}:
-                    metric_ditc['test'].append(float(test_metric_list[feature_number]['test_' + metric]))
-            metric_list.append(metric_ditc)
+        if len(self.classifier_parameter_list) == 1 and is_hyper_parameter:
+            self.AutoLoadClassifierParameterList(relative_path=r'HyperParameters\Classifier')
 
-        # Save the Relationship v.s. number of features
-        if store_folder and os.path.isdir(store_folder):
-            for metric_dict in metric_list:
-                if test_metric_list[0] != {}:
-                    DrawCurve(range(1, self.__max_feature_number + 1), [metric_dict['train'], metric_dict['val'], metric_dict['test']],
-                              xlabel='# Features', ylabel=metric_dict['name'],
-                              name_list=['train', 'validation', 'test'], is_show=False,
-                              store_path=os.path.join(store_folder, metric_dict['name'] + '_FeatureNum.jpg'))
-                else:
-                    DrawCurve(range(1, self.__max_feature_number + 1), [metric_dict['train'], metric_dict['val']],
-                              xlabel='# Features', ylabel=metric_dict['name'],
-                              name_list=['train', 'validation'], is_show=False,
-                              store_path=os.path.join(store_folder, metric_dict['name'] + '_FeatureNum.jpg'))
+        for parameter in self.classifier_parameter_list:
+            self.SetDefaultClassifier()
+            self.classifier.SetModelParameter(parameter)
 
-        val_return_list = []
-        test_return_max_val_list = []
-        test_return_max_test_list = []
+            for train_index, val_index in self.__cv.split(data, label):
+                group_index += 1
 
-        for metric_dict in metric_list:
-            metric_info = {}
-            new_info = val_metric_list[np.argmax(metric_dict['val'])]
-            metric_info['feature_number'] = np.argmax(metric_dict['val']) + 1
-            for key in new_info.keys():
-                metric_info[key[4:]] = new_info[key]
-            val_return_list.append(dict(sorted(metric_info.items(), key=lambda item:item[0])))
+                train_data = data[train_index, :]
+                train_label = label[train_index]
+                val_data = data[val_index, :]
+                val_label = label[val_index]
 
-            if test_metric_list[0] != {}:
-                # Max the validation
-                test_metric_info = {}
-                test_new_info = test_metric_list[np.argmax(metric_dict['val'])]
-                test_metric_info['feature_number'] = np.argmax(metric_dict['val']) + 1
-                for key in test_new_info.keys():
-                    test_metric_info[key[5:]] = test_new_info[key]
-                test_return_max_val_list.append(dict(sorted(test_metric_info.items(), key=lambda item: item[0])))
+                self.classifier.SetData(train_data, train_label)
+                self.classifier.Fit()
 
-                # Max the testing data
-                test_metric_info = {}
-                test_new_info = test_metric_list[np.argmax(metric_dict['test'])]
-                test_metric_info['feature_number'] = np.argmax(metric_dict['test']) + 1
-                for key in test_new_info.keys():
-                    test_metric_info[key[5:]] = test_new_info[key]
-                test_return_max_test_list.append(dict(sorted(test_metric_info.items(), key=lambda item:item[0])))
+                train_prob = self.classifier.Predict(train_data)
+                val_prob = self.classifier.Predict(val_data)
 
-        return val_return_list, test_return_max_val_list, test_return_max_test_list
+                for index in range(len(train_index)):
+                    train_cv_info.append([case_name[train_index[index]], str(group_index), train_prob[index], train_label[index]])
+                for index in range(len(val_index)):
+                    val_cv_info.append([case_name[val_index[index]], str(group_index), val_prob[index], val_label[index]])
 
+                train_pred_list.extend(train_prob)
+                train_label_list.extend(train_label)
+                val_pred_list.extend(val_prob)
+                val_label_list.extend(val_label)
 
+            total_train_label = np.asarray(train_label_list, dtype=np.uint8)
+            total_train_pred = np.asarray(train_pred_list, dtype=np.float32)
+            train_cv_metric = EstimateMetirc(total_train_pred, total_train_label, 'train')
 
+            total_val_label = np.asarray(val_label_list, dtype=np.uint8)
+            total_val_pred = np.asarray(val_pred_list, dtype=np.float32)
+            val_cv_metric = EstimateMetirc(total_val_pred, total_val_label, 'val')
+
+            param_metric_train_auc.append(float(train_cv_metric['train_auc']))
+            param_metric_val_auc.append(float(val_cv_metric['val_auc']))
+            param_all.append({'total_train_label': total_train_label,
+                              'total_train_pred': total_train_pred,
+                              'train_metric': train_cv_metric,
+                              'train_cv_info': train_cv_info,
+                              'total_val_label': total_val_label,
+                              'total_val_pred': total_val_pred,
+                              'val_metric': val_cv_metric,
+                              'val_cv_info': val_cv_info
+                              })
+
+        # find the best parameter
+        index = np.argmax(param_metric_val_auc)
+        total_train_label = param_all[index]['total_train_label']
+        total_train_pred = param_all[index]['total_train_pred']
+        train_cv_metric = param_all[index]['train_metric']
+        train_cv_info = param_all[index]['train_cv_info']
+        total_val_label = param_all[index]['total_val_label']
+        total_val_pred = param_all[index]['total_val_pred']
+        val_cv_metric = param_all[index]['val_metric']
+        val_cv_info = param_all[index]['val_cv_info']
+
+        self.SetDefaultClassifier()
+        self.classifier.SetModelParameter(self.classifier_parameter_list[index])
+        self.classifier.SetDataContainer(data_container)
+        self.classifier.Fit()
+
+        all_train_pred = self.classifier.Predict(data_container.GetArray())
+        all_train_label = data_container.GetLabel()
+        all_train_metric = EstimateMetirc(all_train_pred, all_train_label, 'all_train')
+
+        test_metric = {}
+        if test_data_container.GetArray().size > 0:
+            test_data = test_data_container.GetArray()
+            test_label = test_data_container.GetLabel()
+            test_case_name = test_data_container.GetCaseName()
+            test_pred = self.classifier.Predict(test_data)
+
+            test_metric = EstimateMetirc(test_pred, test_label, 'test')
+
+        if store_folder:
+            if not os.path.exists(store_folder):
+                os.mkdir(store_folder)
+
+            # Save the Parameter:
+            if self.classifier_parameter_list[0] != {}:
+                with open(os.path.join(store_folder, 'Classifier_Param_Result.csv'), 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(['Param', 'Train AUC', 'Val AUC'])
+                    for param, param_index in zip(self.classifier_parameter_list, range(len(self.classifier_parameter_list))):
+                        writer.writerow([self._GetNameOfParamDict(param),
+                                         param_metric_train_auc[param_index],
+                                         param_metric_val_auc[param_index]])
+
+            info = {}
+            info.update(train_cv_metric)
+            info.update(val_cv_metric)
+            info.update(all_train_metric)
+
+            np.save(os.path.join(store_folder, 'train_predict.npy'), total_train_pred)
+            np.save(os.path.join(store_folder, 'train_label.npy'), total_train_label)
+            np.save(os.path.join(store_folder, 'val_predict.npy'), total_val_pred)
+            np.save(os.path.join(store_folder, 'val_label.npy'), total_val_label)
+            np.save(os.path.join(store_folder, 'all_train_predict.npy'), all_train_pred)
+            np.save(os.path.join(store_folder, 'all_train_label.npy'), all_train_label)
+
+            with open(os.path.join(store_folder, 'train_cv5_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(train_cv_info)
+            with open(os.path.join(store_folder, 'val_cv5_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(val_cv_info)
+
+            if test_data_container.GetArray().size > 0:
+                info.update(test_metric)
+                np.save(os.path.join(store_folder, 'test_predict.npy'), test_pred)
+                np.save(os.path.join(store_folder, 'test_label.npy'), test_label)
+
+                test_result_info = [['CaseName', 'Pred', 'Label']]
+                for index in range(len(test_label)):
+                    test_result_info.append([test_case_name[index], test_pred[index], test_label[index]])
+                with open(os.path.join(store_folder, 'test_info.csv'), 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerows(test_result_info)
+
+            self.classifier.Save(store_folder)
+            self.SaveResult(info, store_folder)
+
+        return train_cv_metric, val_cv_metric, test_metric, all_train_metric
+
+class CrossValidation10Folder(CrossValidation):
+    def __init__(self):
+        super(CrossValidation10Folder, self).__init__()
+        self.__cv = StratifiedKFold(10)
+
+    def GetCV(self):
+        return self.__cv
+
+    def GetName(self):
+        return '10-Folder'
+
+    def GetDescription(self, is_test_data_container=False):
+        if is_test_data_container:
+            text = "To determine the hyper-parameter (e.g. the number of features) of model, we applied cross validation " \
+                   "with 10-folder on the training data set. The hyper-parameters were set according to the model performance " \
+                   "on the validation data set. "
+        else:
+            text = "To prove the performance of the model, we applied corss validation with 10-folder on the data set. "
+
+        return text
+
+    def Run(self, data_container, test_data_container=DataContainer(), store_folder='', relative_config_path=r'FAE\HyperParameterConfig'):
+        train_pred_list, train_label_list, val_pred_list, val_label_list = [], [], [], []
+
+        data = data_container.GetArray()
+        label = data_container.GetLabel()
+        case_name = data_container.GetCaseName()
+        group_index = 0
+
+        train_cv_info = [['CaseName', 'Group', 'Pred', 'Label']]
+        val_cv_info = [['CaseName', 'Group', 'Pred', 'Label']]
+
+        param_metric_train_auc = []
+        param_metric_val_auc = []
+        param_all = []
+
+        if len(self.classifier_parameter_list) == 1:
+            self.AutoLoadClassifierParameterList(relative_path=relative_config_path)
+
+        for parameter in self.classifier_parameter_list:
+            self.SetDefaultClassifier()
+            self.classifier.SetModelParameter(parameter)
+
+            for train_index, val_index in self.__cv.split(data, label):
+                group_index += 1
+
+                train_data = data[train_index, :]
+                train_label = label[train_index]
+                val_data = data[val_index, :]
+                val_label = label[val_index]
+
+                self.classifier.SetData(train_data, train_label)
+                self.classifier.Fit()
+
+                train_prob = self.classifier.Predict(train_data)
+                val_prob = self.classifier.Predict(val_data)
+
+                for index in range(len(train_index)):
+                    train_cv_info.append([case_name[train_index[index]], str(group_index), train_prob[index], train_label[index]])
+                for index in range(len(val_index)):
+                    val_cv_info.append([case_name[val_index[index]], str(group_index), val_prob[index], val_label[index]])
+
+                train_pred_list.extend(train_prob)
+                train_label_list.extend(train_label)
+                val_pred_list.extend(val_prob)
+                val_label_list.extend(val_label)
+
+            total_train_label = np.asarray(train_label_list, dtype=np.uint8)
+            total_train_pred = np.asarray(train_pred_list, dtype=np.float32)
+            train_cv_metric = EstimateMetirc(total_train_pred, total_train_label, 'train')
+
+            total_val_label = np.asarray(val_label_list, dtype=np.uint8)
+            total_val_pred = np.asarray(val_pred_list, dtype=np.float32)
+            val_cv_metric = EstimateMetirc(total_val_pred, total_val_label, 'val')
+
+            param_metric_train_auc.append(float(train_cv_metric['train_auc']))
+            param_metric_val_auc.append(float(val_cv_metric['val_auc']))
+            param_all.append({'total_train_label': total_train_label,
+                              'total_train_pred': total_train_pred,
+                              'train_metric': train_cv_metric,
+                              'train_cv_info': train_cv_info,
+                              'total_val_label': total_val_label,
+                              'total_val_pred': total_val_pred,
+                              'val_metric': val_cv_metric,
+                              'val_cv_info': val_cv_info
+                              })
+
+        # find the best parameter
+        index = np.argmax(param_metric_val_auc)
+        total_train_label = param_all[index]['total_train_label']
+        total_train_pred = param_all[index]['total_train_pred']
+        train_cv_metric = param_all[index]['train_metric']
+        train_cv_info = param_all[index]['train_cv_info']
+        total_val_label = param_all[index]['total_val_label']
+        total_val_pred = param_all[index]['total_val_pred']
+        val_cv_metric = param_all[index]['val_metric']
+        val_cv_info = param_all[index]['val_cv_info']
+
+        self.SetDefaultClassifier()
+        self.classifier.SetModelParameter(self.classifier_parameter_list[index])
+        self.classifier.SetDataContainer(data_container)
+        self.classifier.Fit()
+
+        all_train_pred = self.classifier.Predict(data_container.GetArray())
+        all_train_label = data_container.GetLabel()
+        all_train_metric = EstimateMetirc(all_train_pred, all_train_label, 'all_train')
+
+        test_metric = {}
+        if test_data_container.GetArray().size > 0:
+            test_data = test_data_container.GetArray()
+            test_label = test_data_container.GetLabel()
+            test_case_name = test_data_container.GetCaseName()
+            test_pred = self.classifier.Predict(test_data)
+
+            test_metric = EstimateMetirc(test_pred, test_label, 'test')
+
+        if store_folder:
+            if not os.path.exists(store_folder):
+                os.mkdir(store_folder)
+
+            # Save the Parameter:
+            if self.classifier_parameter_list[0] != {}:
+                with open(os.path.join(store_folder, 'Classifier_Param_Result.csv'), 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(['Param', 'Train AUC', 'Val AUC'])
+                    for param, param_index in zip(self.classifier_parameter_list, range(len(self.classifier_parameter_list))):
+                        writer.writerow([self._GetNameOfParamDict(param),
+                                         param_metric_train_auc[param_index],
+                                         param_metric_val_auc[param_index]])
+
+            info = {}
+            info.update(train_cv_metric)
+            info.update(val_cv_metric)
+            info.update(all_train_metric)
+
+            np.save(os.path.join(store_folder, 'train_predict.npy'), total_train_pred)
+            np.save(os.path.join(store_folder, 'train_label.npy'), total_train_label)
+            np.save(os.path.join(store_folder, 'val_predict.npy'), total_val_pred)
+            np.save(os.path.join(store_folder, 'val_label.npy'), total_val_label)
+            np.save(os.path.join(store_folder, 'all_train_predict.npy'), all_train_pred)
+            np.save(os.path.join(store_folder, 'all_train_label.npy'), all_train_label)
+
+            with open(os.path.join(store_folder, 'train_cv5_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(train_cv_info)
+            with open(os.path.join(store_folder, 'val_cv5_info.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(val_cv_info)
+
+            if test_data_container.GetArray().size > 0:
+                info.update(test_metric)
+                np.save(os.path.join(store_folder, 'test_predict.npy'), test_pred)
+                np.save(os.path.join(store_folder, 'test_label.npy'), test_label)
+
+                test_result_info = [['CaseName', 'Pred', 'Label']]
+                for index in range(len(test_label)):
+                    test_result_info.append([test_case_name[index], test_pred[index], test_label[index]])
+                with open(os.path.join(store_folder, 'test_info.csv'), 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerows(test_result_info)
+
+            self.classifier.Save(store_folder)
+            self.SaveResult(info, store_folder)
+
+        return train_cv_metric, val_cv_metric, test_metric, all_train_metric
+
+if __name__ == '__main__':
+    from FAE.DataContainer.DataContainer import DataContainer
+    from FAE.FeatureAnalysis.Normalizer import NormalizerZeroCenter
+    from FAE.FeatureAnalysis.Classifier import SVM, LR, LDA, LRLasso, GaussianProcess, NaiveBayes, DecisionTree, RandomForest, AE, AdaBoost
+    import numpy as np
+
+    train_data_container = DataContainer()
+    train_data_container.Load(r'C:\MyCode\FAEGitHub\FAE\Example\withoutshape\non_balance_features.csv')
+
+    normalizer = NormalizerZeroCenter()
+    train_data_container = normalizer.Run(train_data_container)
+
+    data = train_data_container.GetArray()
+    label = np.asarray(train_data_container.GetLabel())
+
+#     param_list = [
+# {"hidden_layer_sizes": [(30,), (100,)],
+# "solver": ["adam"],
+# "alpha": [0.0001, 0.001],
+# "learning_rate_init": [0.001, 0.01]}
+# ]
+#     from sklearn.model_selection import ParameterGrid
+#     pl = ParameterGrid(param_list)
+
+    cv = CrossValidation5Folder()
+    cv.SetClassifier(LR())
+    # cv.SetClassifierParameterList(pl)
+    train_metric, val_metric, test_metric = cv.Run(train_data_container, store_folder=r'C:\Users\SY\Desktop\temp_fae',
+                                                   relative_config_path=r'..\..\HyperParameters\Classifier')
+    print(train_metric)
+    print(val_metric)
+
+    cv.SetClassifier(LRLasso())
+    # cv.SetClassifierParameterList(pl)
+    train_metric, val_metric, test_metric = cv.Run(train_data_container, store_folder=r'C:\Users\SY\Desktop\temp_fae',
+                                                   relative_config_path=r'..\..\HyperParameters\Classifier')
+    print(train_metric)
+    print(val_metric)
